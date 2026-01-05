@@ -99,29 +99,44 @@ def load_descriptions_from_graphs(graph_path: str) -> Dict[str, str]:
 # Dataset that loads preprocessed graphs and text embeddings
 # =========================================================
 class PreprocessedGraphDataset(Dataset):
-    """
-    Dataset that loads pre-saved molecule graphs with optional text embeddings.
-    
-    Args:
-        graph_path: Path to .pkl file containing list of pre-saved graphs
-        emb_dict: Dictionary mapping ID to text embedding tensors (optional)
-    """
-    def __init__(self, graph_path: str, emb_dict: Dict[str, torch.Tensor] = None):
-        print(f"Loading graphs from: {graph_path}")
+    def __init__(self, graph_path, emb_file_path=None, train_mode=False):
         with open(graph_path, 'rb') as f:
             self.graphs = pickle.load(f)
-        self.emb_dict = emb_dict
-        self.ids = [g.id for g in self.graphs]
-        print(f"Loaded {len(self.graphs)} graphs")
+        
+        self.emb_dict = None
+        self.train_mode = train_mode # Flag to enable random sampling
+        
+        if emb_file_path:
+            print(f"Loading embeddings from {emb_file_path}...")
+            # Detect if it's the new pickle format (Dict[id, List[Arrays]])
+            # or the old CSV format (Dict[id, Array])
+            if emb_file_path.endswith('.pkl'):
+                with open(emb_file_path, 'rb') as f:
+                    self.emb_dict = pickle.load(f)
+            else:
+                # Fallback for validation CSV
+                self.emb_dict = load_id2emb(emb_file_path)
 
     def __len__(self):
         return len(self.graphs)
 
     def __getitem__(self, idx):
         graph = self.graphs[idx]
+        
         if self.emb_dict is not None:
             id_ = graph.id
-            text_emb = self.emb_dict[id_]
+            stored_data = self.emb_dict[id_]
+            
+            # LOGIC: Random Choice during Training
+            if self.train_mode and isinstance(stored_data, (list, np.ndarray)) and len(stored_data.shape) > 1:
+                # It's a list of chunks, pick one row randomly
+                num_chunks = len(stored_data)
+                rand_idx = random.randint(0, num_chunks - 1)
+                text_emb = torch.tensor(stored_data[rand_idx])
+            else:
+                # It's a single vector (Validation or old format)
+                text_emb = torch.tensor(stored_data)
+                
             return graph, text_emb
         else:
             return graph

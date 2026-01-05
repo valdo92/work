@@ -92,7 +92,16 @@ def main():
     if not os.path.exists(TEST_GRAPHS):
         print(f"Error: Preprocessed graphs not found at {TEST_GRAPHS}")
         return
-    
+    '''# Let's assume you generated the averaged version for retrieval:
+    with open("data/train_embeddings_chunked.pkl", "rb") as f:
+        train_emb_dict = pickle.load(f)
+        
+    # If the train dictionary contains lists (because of training mode), 
+    # compute the average on the fly here:
+    for k, v in train_emb_dict.items():
+        if len(v.shape) > 1: # It's a list of chunks
+            train_emb_dict[k] = np.mean(v, axis=0)
+'''
     train_emb = load_id2emb(TRAIN_EMB_CSV)
     
     emb_dim = len(next(iter(train_emb.values())))

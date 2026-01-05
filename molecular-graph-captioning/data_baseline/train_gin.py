@@ -21,6 +21,7 @@ VAL_GRAPHS   = "data/validation_graphs.pkl"
 TEST_GRAPHS  = "data/test_graphs.pkl"
 
 TRAIN_EMB_CSV = "data/train_embeddings.csv"
+TRAIN_CHUNKS_PKL = "data/train_chunk_embeddings.pkl"
 VAL_EMB_CSV   = "data/validation_embeddings.csv"
 
 BATCH_SIZE = 128  # Larger batch size is better for Contrastive Loss
@@ -263,7 +264,17 @@ def main():
     else:
         val_emb = None
 
-    train_ds = PreprocessedGraphDataset(TRAIN_GRAPHS, train_emb)
+    train_ds = PreprocessedGraphDataset(
+        TRAIN_GRAPHS, 
+        emb_file_path=TRAIN_CHUNKS_PKL, 
+        train_mode=True  # <--- CRITICAL: Enables random sampling
+    )
+    
+    # 2. Load Validation Data (Standard full description)
+    # We validate on the FULL text to see if the model learned the whole concept
+    if os.path.exists(VAL_GRAPHS):
+        val_emb = load_id2emb(VAL_EMB_CSV)
+        
     train_dl = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn, drop_last=True)
 
     # Initialize GIN model
