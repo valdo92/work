@@ -13,12 +13,14 @@ def generate_embeddings():
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     model = AutoModel.from_pretrained(MODEL_NAME).cuda().eval()
     
-    # We process all three splits
-    splits = ['train', 'validation', 'test'] 
+    # === CHANGE HERE: Removed 'test' from this list ===
+    # The test set graphs do not have descriptions, so we cannot embed them.
+    splits = ['train', 'validation'] 
 
     for split in splits:
         pkl_path = f'data/{split}_graphs.pkl'
         if not os.path.exists(pkl_path):
+            print(f"Skipping {split} (file not found)")
             continue
             
         print(f"Processing {split}...")
@@ -28,9 +30,12 @@ def generate_embeddings():
         data_dict = {}
 
         for graph in tqdm(graphs):
+            # Safety check: ensure description exists
+            if not hasattr(graph, 'description') or graph.description is None:
+                continue
+
             # 1. Chunking Strategy
             raw_desc = graph.description
-            # Split by period, keep chunks with actual content (>15 chars)
             chunks = [s.strip() for s in raw_desc.split('.') if len(s.strip()) > 15]
             if len(chunks) == 0: chunks = [raw_desc]
             
@@ -39,16 +44,14 @@ def generate_embeddings():
                 inputs = tokenizer(chunks, return_tensors='pt', padding=True, 
                                  truncation=True, max_length=MAX_LEN).to('cuda')
                 outputs = model(**inputs)
-                # Shape: [Num_Chunks, 768]
                 chunk_embs = outputs.last_hidden_state[:, 0, :].cpu().numpy()
             
             # 3. SAVE STRATEGY
             if split == 'train':
-                # TRAIN: Save the LIST of chunks (so we can pick randomly later)
+                # TRAIN: Save List of chunks (for random sampling)
                 data_dict[graph.id] = chunk_embs
             else:
-                # VAL/TEST: Save the AVERAGE of chunks (Your idea!)
-                # Shape: [768]
+                # VALIDATION: Save Average vector (for stable ranking)
                 avg_emb = np.mean(chunk_embs, axis=0)
                 data_dict[graph.id] = avg_emb
 

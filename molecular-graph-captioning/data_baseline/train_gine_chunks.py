@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+import numpy as np
 
 from loss import contrastive_loss, ArcFaceLoss, BatchHardTripletLoss
 from torch_geometric.data import Batch
@@ -21,7 +22,7 @@ VAL_GRAPHS   = "data/validation_graphs.pkl"
 TEST_GRAPHS  = "data/test_graphs.pkl"
 
 TRAIN_EMB_CSV = "data/train_embeddings.csv"
-TRAIN_CHUNKS_PKL = "data/train_chunk_embeddings.pkl"
+TRAIN_CHUNKS_PKL = "data/train_embeddings_chunked.pkl"
 VAL_EMB_CSV   = "data/validation_embeddings.csv"
 VAL_CHUNKS_PKL = "data/validation_embeddings_chunked.pkl"
 
@@ -246,39 +247,34 @@ def eval_retrieval(data_path, emb_dict, model, device):
 
     return results
 
-
 def main():
     print(f"Device: {DEVICE}")
 
-    # Check for embeddings
-    if not os.path.exists(TRAIN_EMB_CSV):
-        print(f"Error: {TRAIN_EMB_CSV} not found. Run generate_description_embeddings.py first.")
-        return
-
-    train_emb = load_id2emb(TRAIN_EMB_CSV)
-    # Determine embedding dimension from file (should be 768 for SciBERT)
-    emb_dim = len(next(iter(train_emb.values())))
+    # --- FIX START: Remove dependency on the old CSV ---
+    
+    # We know SciBERT outputs 768 dimensions. 
+    # We don't need to load the huge CSV just to find this number.
+    emb_dim = 768 
     print(f"Text Embedding Dimension: {emb_dim}")
 
-    if os.path.exists(VAL_EMB_CSV):
-        val_emb = load_id2emb(VAL_EMB_CSV)
-    else:
-        val_emb = None
+    # --- FIX END ---
+
+    # 1. Load Training Data using CHUNKS (Pickle)
+    # The dataset class now loads the pickle file directly via emb_file_path
+    if not os.path.exists(TRAIN_CHUNKS_PKL):
+        print(f"Error: {TRAIN_CHUNKS_PKL} not found. Run generate_chunks_embeddings.py first.")
+        return
 
     train_ds = PreprocessedGraphDataset(
         TRAIN_GRAPHS, 
         emb_file_path=TRAIN_CHUNKS_PKL, 
-        train_mode=True  # <--- CRITICAL: Enables random sampling
+        train_mode=True  # Randomly picks 1 sentence chunk per epoch
     )
     
-    # 2. Load Validation Data (Standard full description)
-    # We validate on the FULL text to see if the model learned the whole concept
-    if os.path.exists(VAL_GRAPHS):
-        val_emb = load_id2emb(VAL_EMB_CSV)
-
     train_dl = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn, drop_last=True)
 
-    # Initialize GIN model
+    # Initialize Model
+    # GIN with Edge Features (MolGINE)
     model = MolGINE(hidden=128, out_dim=emb_dim, layers=4).to(DEVICE)
     
     optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=1e-4)
@@ -286,19 +282,26 @@ def main():
 
     best_mrr = 0.0
     
+    print("Starting training...")
+    
     for ep in range(EPOCHS):
         train_loss = train_epoch(model, train_dl, optimizer, DEVICE)
         
-        # 2. Validation Step (Averaged Embeddings)
-        # Check if the validation pickle exists
-        if os.path.exists(VAL_CHUNKS_PKL):
-            # Pass the PATH string, not a dictionary
-            scores = eval_retrieval(VAL_GRAPHS, VAL_CHUNKS_PKL, model, DEVICE)
-            current_mrr = scores['MRR']
-            print(f"Epoch {ep+1} - Val MRR: {scores['MRR']:.4f}")
-            scheduler.step(scores["MRR"])
+        val_results = ""
+        current_mrr = 0.0
         
-        print(f"Epoch {ep+1}/{EPOCHS} - Loss: {train_loss:.4f} {scores}")
+        # 2. Validation Step (Using AVERAGED Embeddings Pickle)
+        if os.path.exists(VAL_CHUNKS_PKL) and os.path.exists(VAL_GRAPHS):
+            # We pass the pickle path directly. 
+            # eval_retrieval will init the dataset with train_mode=False (loading the average vector)
+            scores = eval_retrieval(VAL_GRAPHS, VAL_CHUNKS_PKL, model, DEVICE)
+            
+            current_mrr = scores['MRR']
+            val_results = f"- Val MRR: {current_mrr:.4f} - R@1: {scores['R@1']:.4f} - R@10: {scores['R@10']:.4f}"
+            
+            scheduler.step(current_mrr)
+        
+        print(f"Epoch {ep+1}/{EPOCHS} - Loss: {train_loss:.4f} {val_results}")
         
         # Save best model
         if current_mrr >= best_mrr:
@@ -307,7 +310,6 @@ def main():
             
     print(f"\nBest Validation MRR: {best_mrr:.4f}")
     print("Model saved to model_checkpoint.pt")
-
 
 if __name__ == "__main__":
     main()
