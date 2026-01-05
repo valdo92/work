@@ -88,3 +88,49 @@ def contrastive_loss(mol_features, text_features, temperature=0.1):
     loss = F.cross_entropy(logits, labels)
     return loss
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class BatchHardTripletLoss(nn.Module):
+    def __init__(self, margin=0.2):
+        super().__init__()
+        self.margin = margin
+
+    def forward(self, mol_emb, text_emb):
+        """
+        Args:
+            mol_emb: [batch_size, dim]
+            text_emb: [batch_size, dim]
+        """
+        # 1. Normalize embeddings (Crucial for cosine distance)
+        mol_emb = F.normalize(mol_emb, dim=1)
+        text_emb = F.normalize(text_emb, dim=1)
+
+        # 2. Compute Similarity Matrix (Cosine Similarity)
+        # scores[i, j] = similarity between Mol i and Text j
+        scores = torch.matmul(mol_emb, text_emb.t())
+        
+        # 3. Get Positive Scores (Diagonal)
+        # The score of Mol i with its correct Text i
+        pos_scores = torch.diag(scores)
+        
+        # 4. Get Hardest Negative Scores
+        # We want the highest similarity among the WRONG answers.
+        # We mask the diagonal (correct answers) so we don't pick them.
+        batch_size = mol_emb.size(0)
+        mask = torch.eye(batch_size, device=mol_emb.device).bool()
+        
+        # Set diagonal to -infinity so it's never chosen as the "highest" negative
+        scores_masked = scores.clone()
+        scores_masked.masked_fill_(mask, -float('inf'))
+        
+        # Max score across each row = The hardest negative for that molecule
+        hardest_neg_scores, _ = scores_masked.max(dim=1)
+        
+        # 5. Compute Triplet Loss
+        # Loss = Max(0, Margin + Negative_Score - Positive_Score)
+        # We want Positive_Score > Negative_Score + Margin
+        losses = F.relu(self.margin + hardest_neg_scores - pos_scores)
+        
+        return losses.mean()

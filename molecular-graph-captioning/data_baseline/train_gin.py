@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from loss import contrastive_loss, ArcFaceLoss
+from loss import contrastive_loss, ArcFaceLoss, BatchHardTripletLoss
 from torch_geometric.data import Batch
 from torch_geometric.nn import GINConv, global_add_pool
 
@@ -57,6 +57,22 @@ class AtomEncoder(nn.Module):
             out += self.embeddings[i](x[:, i])
         return out
 
+class EdgeEncoder(nn.Module):
+    def __init__(self, hidden_dim):
+        super().__init__()
+        # Dimensions based on data_utils.e_map
+        self.bond_embedding = nn.Embedding(22, hidden_dim) # bond_type
+        self.stereo_embedding = nn.Embedding(6, hidden_dim) # stereo
+        self.conj_embedding = nn.Embedding(2, hidden_dim)  # is_conjugated
+
+    def forward(self, edge_attr):
+        # edge_attr shape: [num_edges, 3]
+        # Summing embeddings is the standard strategy (like in OGB)
+        bond = self.bond_embedding(edge_attr[:, 0])
+        stereo = self.stereo_embedding(edge_attr[:, 1])
+        conj = self.conj_embedding(edge_attr[:, 2])
+        
+        return bond + stereo + conj
 
 class MolGIN(nn.Module):
     """
@@ -102,11 +118,65 @@ class MolGIN(nn.Module):
         
         return g
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric.nn import GINEConv, global_add_pool
 
+class MolGINE(nn.Module):
+    """
+    GINE: Graph Isomorphism Network with Edge Features
+    """
+    def __init__(self, hidden=128, out_dim=768, layers=4):
+        super().__init__()
+        
+        # 1. Encoders for Atoms and Edges
+        self.atom_encoder = AtomEncoder(hidden) # Use the class provided in previous turn
+        self.edge_encoder = EdgeEncoder(hidden)
+        
+        self.convs = nn.ModuleList()
+        for _ in range(layers):
+            # GINE requires an MLP just like GIN
+            mlp = nn.Sequential(
+                nn.Linear(hidden, 2 * hidden),
+                nn.BatchNorm1d(2 * hidden),
+                nn.ReLU(),
+                nn.Linear(2 * hidden, hidden),
+                nn.BatchNorm1d(hidden),
+                nn.ReLU(),
+            )
+            # GINEConv expects the MLP to process (node + edge) features
+            self.convs.append(GINEConv(mlp, train_eps=True))
+            
+        self.proj = nn.Linear(hidden, out_dim)
+
+    def forward(self, batch):
+        x, edge_index, edge_attr, batch_idx = batch.x, batch.edge_index, batch.edge_attr, batch.batch
+        
+        # 1. Encode Features
+        h = self.atom_encoder(x)          # [Num_Nodes, Hidden]
+        edge_emb = self.edge_encoder(edge_attr) # [Num_Edges, Hidden]
+        
+        # 2. Convolution Layers (Now with Edges!)
+        for conv in self.convs:
+            # GINEConv adds the edge embedding to the neighbor node embedding
+            # before aggregation.
+            h = conv(h, edge_index, edge_attr=edge_emb)
+            h = F.relu(h)
+            
+        # 3. Global Pooling
+        g = global_add_pool(h, batch_idx)
+        
+        # 4. Projection
+        g = self.proj(g)
+        
+        return g
 
 # =========================================================
 # Training Loop
 # =========================================================
+triplet_criterion = BatchHardTripletLoss(margin=0.2).to(DEVICE)
+
 def train_epoch(model, loader, optimizer, device):
     model.train()
     total_loss, total = 0.0, 0
@@ -121,7 +191,7 @@ def train_epoch(model, loader, optimizer, device):
         mol_vec = model(graphs)
         
         # Contrastive Loss
-        loss = contrastive_loss(mol_vec, text_emb)
+        loss = contrastive_loss(mol_vec, text_emb) + triplet_criterion(mol_vec, text_emb)
         
         loss.backward()
         optimizer.step()
@@ -197,7 +267,7 @@ def main():
     train_dl = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn, drop_last=True)
 
     # Initialize GIN model
-    model = MolGIN(hidden=128, out_dim=emb_dim, layers=4).to(DEVICE)
+    model = MolGINE(hidden=128, out_dim=emb_dim, layers=4).to(DEVICE)
     
     optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=2)
