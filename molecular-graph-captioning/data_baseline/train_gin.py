@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
+from loss import contrastive_loss, ArcFaceLoss
 from torch_geometric.data import Batch
 from torch_geometric.nn import GINConv, global_add_pool
 
@@ -23,7 +24,7 @@ TRAIN_EMB_CSV = "data/train_embeddings.csv"
 VAL_EMB_CSV   = "data/validation_embeddings.csv"
 
 BATCH_SIZE = 128  # Larger batch size is better for Contrastive Loss
-EPOCHS = 20       # GIN needs more epochs than the dummy baseline
+EPOCHS = 40       # GIN needs more epochs than the dummy baseline
 LR = 1e-3
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -102,30 +103,6 @@ class MolGIN(nn.Module):
         return g
 
 
-# =========================================================
-# LOSS: Contrastive / InfoNCE
-# =========================================================
-def contrastive_loss(mol_features, text_features, temperature=0.1):
-    """
-    Computes InfoNCE loss.
-    Attempts to align molecules with their correct description 
-    while pushing away others in the batch.
-    """
-    # Normalize features
-    mol_features = F.normalize(mol_features, dim=1)
-    text_features = F.normalize(text_features, dim=1)
-    
-    # Compute similarity matrix (Batch x Batch)
-    logits = torch.matmul(mol_features, text_features.t()) / temperature
-    
-    # Create labels (0, 1, ... Batch-1)
-    # The i-th molecule should match the i-th text
-    labels = torch.arange(logits.size(0)).to(logits.device)
-    
-    # Cross Entropy Loss
-    loss = F.cross_entropy(logits, labels)
-    return loss
-
 
 # =========================================================
 # Training Loop
@@ -139,7 +116,7 @@ def train_epoch(model, loader, optimizer, device):
         text_emb = text_emb.to(device)
         
         optimizer.zero_grad()
-        
+        #criterion = ArcFaceLoss(s=128.0, m=0.1).to(DEVICE)
         # Forward pass
         mol_vec = model(graphs)
         
@@ -222,7 +199,7 @@ def main():
     # Initialize GIN model
     model = MolGIN(hidden=128, out_dim=emb_dim, layers=4).to(DEVICE)
     
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
+    optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=2)
 
     best_mrr = 0.0
@@ -244,7 +221,7 @@ def main():
         # Save best model
         if current_mrr >= best_mrr:
             best_mrr = current_mrr
-            torch.save(model.state_dict(), "model/model_gin/model_checkpoint.pt")
+            torch.save(model.state_dict(), f"model_checkpoint_{best_mrr:.4f}.pt")
             
     print(f"\nBest Validation MRR: {best_mrr:.4f}")
     print("Model saved to model_checkpoint.pt")

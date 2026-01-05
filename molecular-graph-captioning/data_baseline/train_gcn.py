@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-
+from loss import contrastive_loss
 from torch_geometric.data import Batch
 from torch_geometric.nn import GCNConv, global_add_pool
 
@@ -26,7 +26,7 @@ TRAIN_EMB_CSV = "data/train_embeddings.csv"
 VAL_EMB_CSV   = "data/validation_embeddings.csv"
 
 # Training parameters
-BATCH_SIZE = 32
+BATCH_SIZE = 128
 EPOCHS = 5
 LR = 1e-3
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -76,7 +76,7 @@ def train_epoch(mol_enc, loader, optimizer, device):
         mol_vec = mol_enc(graphs)
         txt_vec = F.normalize(text_emb, dim=-1)
 
-        loss = F.mse_loss(mol_vec, txt_vec)
+        loss = contrastive_loss(mol_vec, txt_vec)
 
         optimizer.zero_grad()
         loss.backward()
@@ -156,7 +156,7 @@ def main():
             val_scores = {}
         print(f"Epoch {ep+1}/{EPOCHS} - loss={train_loss:.4f} - val={val_scores}")
     
-    model_path = "model_checkpoint.pt"
+    model_path = f"model_checkpoint{val_scores['MRR']:.3f}.pt"
     torch.save(mol_enc.state_dict(), model_path)
     print(f"\nModel saved to {model_path}")
 
