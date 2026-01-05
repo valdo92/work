@@ -149,6 +149,7 @@ def main():
     optimizer = torch.optim.Adam(mol_enc.parameters(), lr=LR)
 
     for ep in range(EPOCHS):
+        print(ep)
         train_loss = train_epoch(mol_enc, train_dl, optimizer, DEVICE)
         if val_emb is not None and os.path.exists(VAL_GRAPHS):
             val_scores = eval_retrieval(VAL_GRAPHS, val_emb, mol_enc, DEVICE)

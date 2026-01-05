@@ -101,23 +101,40 @@ def load_descriptions_from_graphs(graph_path: str) -> Dict[str, str]:
 # Dataset that loads preprocessed graphs and text embeddings
 # =========================================================
 class PreprocessedGraphDataset(Dataset):
-    def __init__(self, graph_path, emb_file_path=None, train_mode=False):
+    def __init__(self, graph_path: str, emb_file_path=None, train_mode: bool = False, emb_dict=None):
+        """
+        Args:
+            graph_path: Path to graph pickle file.
+            emb_file_path: Path to embedding PKL/CSV OR a Dictionary (legacy support).
+            train_mode: If True, randomly picks one embedding chunk per epoch.
+            emb_dict: Explicit dictionary argument (optional).
+        """
+        print(f"Loading graphs from: {graph_path}")
         with open(graph_path, 'rb') as f:
             self.graphs = pickle.load(f)
         
-        self.emb_dict = None
-        self.train_mode = train_mode # Flag to enable random sampling
-        
-        if emb_file_path:
+        self.ids = [g.id for g in self.graphs]
+        self.train_mode = train_mode
+        self.emb_dict = emb_dict
+
+        # --- SMART DETECTION LOGIC ---
+        # 1. Handle Legacy Call: PreprocessedGraphDataset(graphs, embedding_dictionary)
+        if isinstance(emb_file_path, dict):
+            self.emb_dict = emb_file_path
+            emb_file_path = None # It's not a path, it's data
+
+        # 2. Handle New Call: PreprocessedGraphDataset(graphs, "path/to/file.pkl")
+        if emb_file_path and isinstance(emb_file_path, str):
             print(f"Loading embeddings from {emb_file_path}...")
-            # Detect if it's the new pickle format (Dict[id, List[Arrays]])
-            # or the old CSV format (Dict[id, Array])
             if emb_file_path.endswith('.pkl'):
                 with open(emb_file_path, 'rb') as f:
                     self.emb_dict = pickle.load(f)
             else:
-                # Fallback for validation CSV
+                # Assume CSV
                 self.emb_dict = load_id2emb(emb_file_path)
+        
+        if self.emb_dict:
+            print(f"Loaded embeddings for {len(self.emb_dict)} molecules")
 
     def __len__(self):
         return len(self.graphs)
@@ -127,22 +144,33 @@ class PreprocessedGraphDataset(Dataset):
         
         if self.emb_dict is not None:
             id_ = graph.id
-            stored_data = self.emb_dict[id_]
-            
-            # LOGIC: Random Choice during Training
-            if self.train_mode and isinstance(stored_data, (list, np.ndarray)) and len(stored_data.shape) > 1:
-                # It's a list of chunks, pick one row randomly
-                num_chunks = len(stored_data)
-                rand_idx = random.randint(0, num_chunks - 1)
-                text_emb = torch.tensor(stored_data[rand_idx])
-            else:
-                # It's a single vector (Validation or old format)
-                text_emb = torch.tensor(stored_data)
+            if id_ in self.emb_dict:
+                stored_data = self.emb_dict[id_]
                 
+                # Check if it is a list of chunks (3D array from pickle)
+                if isinstance(stored_data, (list, np.ndarray)) and len(np.shape(stored_data)) > 1:
+                    if self.train_mode:
+                        # TRAINING CHUNKS: Pick one randomly
+                        num_chunks = len(stored_data)
+                        rand_idx = np.random.randint(0, num_chunks)
+                        text_emb = torch.tensor(stored_data[rand_idx], dtype=torch.float32)
+                    else:
+                        # VALIDATION CHUNKS: Average them
+                        mean_emb = np.mean(stored_data, axis=0)
+                        text_emb = torch.tensor(mean_emb, dtype=torch.float32)
+                else:
+                    # STANDARD/LEGACY: Single vector (from CSV or averaged pickle)
+                    if not torch.is_tensor(stored_data):
+                        text_emb = torch.tensor(stored_data, dtype=torch.float32)
+                    else:
+                        text_emb = stored_data
+            else:
+                # Fallback for missing IDs
+                text_emb = torch.zeros(768) 
+
             return graph, text_emb
         else:
             return graph
-
 
 def collate_fn(batch):
     """

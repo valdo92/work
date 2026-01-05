@@ -9,8 +9,8 @@ from data_utils import (
     load_id2emb, load_descriptions_from_graphs, PreprocessedGraphDataset, collate_fn
 )
 
-from train_gcn import (
-    MolGNN, DEVICE, TRAIN_GRAPHS, TEST_GRAPHS, TRAIN_EMB_CSV
+from train_gin import (
+    MolGINE, DEVICE, TRAIN_GRAPHS, TEST_GRAPHS, TRAIN_EMB_CSV
 )
 
 
@@ -83,7 +83,7 @@ def main():
     
     output_csv = "test_retrieved_descriptions.csv"
     
-    model_path = "model_checkpoint.pt"
+    model_path = "model_checkpoint_0.2687.pt"
     if not os.path.exists(model_path):
         print(f"Error: Model checkpoint '{model_path}' not found.")
         print("Please train a model first using train_gcn.py")
@@ -106,7 +106,7 @@ def main():
     
     emb_dim = len(next(iter(train_emb.values())))
     
-    model = MolGNN(out_dim=emb_dim).to(DEVICE)
+    model = MolGINE(out_dim=emb_dim).to(DEVICE)
     print(f"Loading model from {model_path}")
     model.load_state_dict(torch.load(model_path, map_location=DEVICE))
     model.eval()

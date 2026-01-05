@@ -21,12 +21,10 @@ VAL_GRAPHS   = "data/validation_graphs.pkl"
 TEST_GRAPHS  = "data/test_graphs.pkl"
 
 TRAIN_EMB_CSV = "data/train_embeddings.csv"
-TRAIN_CHUNKS_PKL = "data/train_chunk_embeddings.pkl"
 VAL_EMB_CSV   = "data/validation_embeddings.csv"
-VAL_CHUNKS_PKL = "data/validation_embeddings_chunked.pkl"
 
 BATCH_SIZE = 128  # Larger batch size is better for Contrastive Loss
-EPOCHS = 40       # GIN needs more epochs than the dummy baseline
+EPOCHS = 250       # GIN needs more epochs than the dummy baseline
 LR = 1e-3
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -250,60 +248,53 @@ def eval_retrieval(data_path, emb_dict, model, device):
 def main():
     print(f"Device: {DEVICE}")
 
-    # Check for embeddings
-    if not os.path.exists(TRAIN_EMB_CSV):
-        print(f"Error: {TRAIN_EMB_CSV} not found. Run generate_description_embeddings.py first.")
-        return
-
     train_emb = load_id2emb(TRAIN_EMB_CSV)
-    # Determine embedding dimension from file (should be 768 for SciBERT)
+    val_emb = load_id2emb(VAL_EMB_CSV) if os.path.exists(VAL_EMB_CSV) else None
+
     emb_dim = len(next(iter(train_emb.values())))
-    print(f"Text Embedding Dimension: {emb_dim}")
 
-    if os.path.exists(VAL_EMB_CSV):
-        val_emb = load_id2emb(VAL_EMB_CSV)
-    else:
-        val_emb = None
-
-    train_ds = PreprocessedGraphDataset(
-        TRAIN_GRAPHS, 
-        emb_file_path=TRAIN_CHUNKS_PKL, 
-        train_mode=True  # <--- CRITICAL: Enables random sampling
-    )
+    if not os.path.exists(TRAIN_GRAPHS):
+        print(f"Error: Preprocessed graphs not found at {TRAIN_GRAPHS}")
+        print("Please run: python prepare_graph_data.py")
+        return
     
-    # 2. Load Validation Data (Standard full description)
-    # We validate on the FULL text to see if the model learned the whole concept
-    if os.path.exists(VAL_GRAPHS):
-        val_emb = load_id2emb(VAL_EMB_CSV)
+    train_ds = PreprocessedGraphDataset(TRAIN_GRAPHS, train_emb)
+    print("preprocessed")
+    train_dl = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
+    model = MolGINE(out_dim=emb_dim).to(DEVICE)
 
-    train_dl = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn, drop_last=True)
-
-    # Initialize GIN model
-    model = MolGINE(hidden=128, out_dim=emb_dim, layers=4).to(DEVICE)
-    
     optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=2)
 
     best_mrr = 0.0
-    
+    patience_counter =0
+
     for ep in range(EPOCHS):
         train_loss = train_epoch(model, train_dl, optimizer, DEVICE)
         
         # 2. Validation Step (Averaged Embeddings)
         # Check if the validation pickle exists
-        if os.path.exists(VAL_CHUNKS_PKL):
+        if val_emb is not None and os.path.exists(VAL_GRAPHS):
+            scores = eval_retrieval(VAL_GRAPHS, val_emb, model, DEVICE)
+        else:
+            scores = {}
             # Pass the PATH string, not a dictionary
-            scores = eval_retrieval(VAL_GRAPHS, VAL_CHUNKS_PKL, model, DEVICE)
-            current_mrr = scores['MRR']
-            print(f"Epoch {ep+1} - Val MRR: {scores['MRR']:.4f}")
-            scheduler.step(scores["MRR"])
+        current_mrr = scores['MRR']
+        print(f"Epoch {ep+1} - Val MRR: {scores['MRR']:.4f}")
+        scheduler.step(scores["MRR"])
         
         print(f"Epoch {ep+1}/{EPOCHS} - Loss: {train_loss:.4f} {scores}")
         
         # Save best model
         if current_mrr >= best_mrr:
+            patience_counter =0
             best_mrr = current_mrr
             torch.save(model.state_dict(), f"model_checkpoint_{best_mrr:.4f}.pt")
+        else : 
+            patience_counter +=1
+            if patience_counter >10:
+                print("\nEarly stopping triggered! Training finished.")
+                break
             
     print(f"\nBest Validation MRR: {best_mrr:.4f}")
     print("Model saved to model_checkpoint.pt")
