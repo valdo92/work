@@ -8,6 +8,7 @@ from loss import contrastive_loss, ArcFaceLoss, BatchHardTripletLoss
 from torch_geometric.data import Batch
 from torch_geometric.nn import GINConv, global_add_pool
 
+from transformers import get_cosine_schedule_with_warmup
 from data_utils import (
     load_id2emb,
     PreprocessedGraphDataset, collate_fn
@@ -23,8 +24,8 @@ TEST_GRAPHS  = "data/test_graphs.pkl"
 TRAIN_EMB_CSV = "data/train_embeddings.csv"
 VAL_EMB_CSV   = "data/validation_embeddings.csv"
 
-BATCH_SIZE = 128  # Larger batch size is better for Contrastive Loss
-EPOCHS = 250       # GIN needs more epochs than the dummy baseline
+BATCH_SIZE = 256  # Larger batch size is better for Contrastive Loss
+EPOCHS = 40       # GIN needs more epochs than the dummy baseline
 LR = 1e-3
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -123,20 +124,35 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GINEConv, global_add_pool
 
+# --- 1. Trainable Text Adapter ---
+class TextAdapter(nn.Module):
+    """
+    Feeds the frozen BERT embeddings into a trainable MLP.
+    Allows the text space to align with the graph space.
+    """
+    def __init__(self, input_dim=768, hidden_dim=300, output_dim=300):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, output_dim) # Project to shared space
+        )
+
+    def forward(self, x):
+        return self.mlp(x)
+
+# --- 2. Upgraded GINE with Projection Head ---
 class MolGINE(nn.Module):
-    """
-    GINE: Graph Isomorphism Network with Edge Features
-    """
-    def __init__(self, hidden=128, out_dim=768, layers=4):
+    def __init__(self, hidden=300, out_dim=300, layers=5): # Increased hidden & layers
         super().__init__()
         
-        # 1. Encoders for Atoms and Edges
-        self.atom_encoder = AtomEncoder(hidden) # Use the class provided in previous turn
+        # Encoders (Now hidden=300)
+        self.atom_encoder = AtomEncoder(hidden)
         self.edge_encoder = EdgeEncoder(hidden)
         
         self.convs = nn.ModuleList()
         for _ in range(layers):
-            # GINE requires an MLP just like GIN
             mlp = nn.Sequential(
                 nn.Linear(hidden, 2 * hidden),
                 nn.BatchNorm1d(2 * hidden),
@@ -145,56 +161,82 @@ class MolGINE(nn.Module):
                 nn.BatchNorm1d(hidden),
                 nn.ReLU(),
             )
-            # GINEConv expects the MLP to process (node + edge) features
             self.convs.append(GINEConv(mlp, train_eps=True))
             
-        self.proj = nn.Linear(hidden, out_dim)
+        # PROJECTION HEAD (The SimCLR trick)
+        # Instead of direct projection, we use an MLP
+        self.proj_head = nn.Sequential(
+            nn.Linear(hidden, hidden),
+            nn.BatchNorm1d(hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, out_dim) # Project to shared space (e.g. 300)
+        )
 
     def forward(self, batch):
         x, edge_index, edge_attr, batch_idx = batch.x, batch.edge_index, batch.edge_attr, batch.batch
         
-        # 1. Encode Features
-        h = self.atom_encoder(x)          # [Num_Nodes, Hidden]
-        edge_emb = self.edge_encoder(edge_attr) # [Num_Edges, Hidden]
+        h = self.atom_encoder(x)
+        edge_emb = self.edge_encoder(edge_attr)
         
-        # 2. Convolution Layers (Now with Edges!)
         for conv in self.convs:
-            # GINEConv adds the edge embedding to the neighbor node embedding
-            # before aggregation.
+            h_in = h
             h = conv(h, edge_index, edge_attr=edge_emb)
             h = F.relu(h)
+            h = h + h_in
             
-        # 3. Global Pooling
         g = global_add_pool(h, batch_idx)
         
-        # 4. Projection
-        g = self.proj(g)
-        
-        return g
+        # Pass through Projection Head
+        return self.proj_head(g)
 
-# =========================================================
+def augment_graph(data, mask_prob=0.15, drop_prob=0.1):
+    """
+    1. Masking: Randomly zeros out node features.
+    2. Dropping: Randomly removes edges.
+    """
+    data = data.clone()
+    node_num = data.x.size(0)
+    edge_num = data.edge_index.size(1)
+
+    # 1. Mask Node Features
+    mask = torch.rand(node_num) < mask_prob
+    data.x[mask] = 0 # Assuming 0 is the padding index
+
+    # 2. Drop Edges
+    keep_edges = torch.rand(edge_num) > drop_prob
+    data.edge_index = data.edge_index[:, keep_edges]
+    data.edge_attr = data.edge_attr[keep_edges]
+
+    return data
+
+#=======================================================
 # Training Loop
 # =========================================================
 triplet_criterion = BatchHardTripletLoss(margin=0.2).to(DEVICE)
 
-def train_epoch(model, loader, optimizer, device):
-    model.train()
+def train_epoch(graph_model, text_adapter, loader, optimizer,scheduler, device):
+    graph_model.train()
+    text_adapter.train() # Don't forget to set this to train mode!
     total_loss, total = 0.0, 0
     
-    for graphs, text_emb in loader:
-        graphs = graphs.to(device)
-        text_emb = text_emb.to(device)
+    for graphs, text_emb_frozen in loader:
+        graphs = augment_graph(graphs).to(device)
+        text_emb_frozen = text_emb_frozen.to(device)
         
         optimizer.zero_grad()
-        #criterion = ArcFaceLoss(s=128.0, m=0.1).to(DEVICE)
-        # Forward pass
-        mol_vec = model(graphs)
         
-        # Contrastive Loss
-        loss = contrastive_loss(mol_vec, text_emb) + triplet_criterion(mol_vec, text_emb)
+        # 1. Forward Pass Graph
+        mol_vec = graph_model(graphs)  # Shape: [Batch, 300]
+        
+        # 2. Forward Pass Text (Through Adapter)
+        text_vec = text_adapter(text_emb_frozen) # Shape: [Batch, 300]
+        
+        # 3. Contrastive Loss (Now dimensions match: 300 vs 300)
+        loss = contrastive_loss(mol_vec, text_vec)
         
         loss.backward()
         optimizer.step()
+        scheduler.step()
         
         bs = graphs.num_graphs
         total_loss += loss.item() * bs
@@ -204,21 +246,24 @@ def train_epoch(model, loader, optimizer, device):
 
 
 @torch.no_grad()
-def eval_retrieval(data_path, emb_dict, model, device):
-    """Computes Mean Reciprocal Rank (MRR) and Hit@K"""
-    model.eval()
+def eval_retrieval(data_path, emb_dict, graph_model, text_adapter, device):
+    graph_model.eval()
+    text_adapter.eval()
+    
     ds = PreprocessedGraphDataset(data_path, emb_dict)
     dl = DataLoader(ds, batch_size=64, shuffle=False, collate_fn=collate_fn)
 
     all_mol, all_txt = [], []
-    for graphs, text_emb in dl:
+    for graphs, text_emb_frozen in dl:
         graphs = graphs.to(device)
-        text_emb = text_emb.to(device)
+        text_emb_frozen = text_emb_frozen.to(device)
         
-        mol_vec = model(graphs)
+        # Project BOTH to shared 300-dim space
+        mol_vec = graph_model(graphs)
+        text_vec = text_adapter(text_emb_frozen)
         
         all_mol.append(F.normalize(mol_vec, dim=-1))
-        all_txt.append(F.normalize(text_emb, dim=-1))
+        all_txt.append(F.normalize(text_vec, dim=-1)) # Normalize the ADAPTED text
         
     all_mol = torch.cat(all_mol, dim=0)
     all_txt = torch.cat(all_txt, dim=0)
@@ -226,24 +271,15 @@ def eval_retrieval(data_path, emb_dict, model, device):
     # Similarity matrix
     sims = all_mol @ all_txt.t()
     
-    # Get ranks
+    # ... (Rest of ranking logic stays the same) ...
     ranks = sims.argsort(dim=-1, descending=True)
-    
-    # Ground truth indices
     N = all_txt.size(0)
     correct_indices = torch.arange(N, device=device).unsqueeze(1)
-    
-    # Find position of correct index in ranks
     pos = (ranks == correct_indices).nonzero()[:, 1] + 1
-    
     mrr = (1.0 / pos.float()).mean().item()
     
     results = {"MRR": mrr}
-    for k in (1, 5, 10):
-        results[f"R@{k}"] = (pos <= k).float().mean().item()
-
     return results
-
 
 def main():
     print(f"Device: {DEVICE}")
@@ -261,35 +297,49 @@ def main():
     train_ds = PreprocessedGraphDataset(TRAIN_GRAPHS, train_emb)
     print("preprocessed")
     train_dl = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
-    model = MolGINE(out_dim=emb_dim).to(DEVICE)
+    total_steps = len(train_dl) * EPOCHS
+    # --- 3. Updated Training Loop Snippet ---
+    # Initialize BOTH models
+    graph_model = MolGINE(hidden=300, out_dim=300).to(DEVICE)
+    text_adapter = TextAdapter(input_dim=768, output_dim=300).to(DEVICE)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=2)
+    # Optimizer handles parameters from BOTH
+    optimizer = torch.optim.Adam(
+        list(graph_model.parameters()) + list(text_adapter.parameters()), 
+        lr=1e-3, weight_decay=1e-5
+    )
 
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer, 
+        num_warmup_steps=int(0.1 * total_steps), 
+        num_training_steps=total_steps
+    )
     best_mrr = 0.0
     patience_counter =0
 
     for ep in range(EPOCHS):
-        train_loss = train_epoch(model, train_dl, optimizer, DEVICE)
+        train_loss = train_epoch(graph_model, text_adapter, train_dl, optimizer, scheduler, DEVICE)
         
         # 2. Validation Step (Averaged Embeddings)
         # Check if the validation pickle exists
         if val_emb is not None and os.path.exists(VAL_GRAPHS):
-            scores = eval_retrieval(VAL_GRAPHS, val_emb, model, DEVICE)
+            scores = eval_retrieval(VAL_GRAPHS, val_emb, graph_model,text_adapter, DEVICE)
         else:
             scores = {}
             # Pass the PATH string, not a dictionary
         current_mrr = scores['MRR']
         print(f"Epoch {ep+1} - Val MRR: {scores['MRR']:.4f}")
-        scheduler.step(scores["MRR"])
         
         print(f"Epoch {ep+1}/{EPOCHS} - Loss: {train_loss:.4f} {scores}")
         
         # Save best model
         if current_mrr >= best_mrr:
-            patience_counter =0
             best_mrr = current_mrr
-            torch.save(model.state_dict(), f"model_checkpoint_{best_mrr:.4f}.pt")
+            # SAVE BOTH MODELS
+            torch.save({
+                'graph_model': graph_model.state_dict(),
+                'text_adapter': text_adapter.state_dict()
+            }, f"model_checkpoint_{best_mrr:.4f}.pt")
         else : 
             patience_counter +=1
             if patience_counter >10:

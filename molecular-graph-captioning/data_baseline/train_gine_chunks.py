@@ -27,7 +27,7 @@ VAL_EMB_CSV   = "data/validation_embeddings.csv"
 VAL_CHUNKS_PKL = "data/validation_embeddings_chunked.pkl"
 
 BATCH_SIZE = 128  # Larger batch size is better for Contrastive Loss
-EPOCHS = 40       # GIN needs more epochs than the dummy baseline
+EPOCHS = 250       # GIN needs more epochs than the dummy baseline
 LR = 1e-3
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -281,7 +281,7 @@ def main():
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=2)
 
     best_mrr = 0.0
-    
+    patience_increment =0
     print("Starting training...")
     
     for ep in range(EPOCHS):
@@ -305,8 +305,14 @@ def main():
         
         # Save best model
         if current_mrr >= best_mrr:
+            patience_increment =0
             best_mrr = current_mrr
             torch.save(model.state_dict(), f"model_checkpoint_{best_mrr:.4f}.pt")
+
+        else : 
+            patience_increment +=1
+            if patience_increment >10 :
+                break
             
     print(f"\nBest Validation MRR: {best_mrr:.4f}")
     print("Model saved to model_checkpoint.pt")

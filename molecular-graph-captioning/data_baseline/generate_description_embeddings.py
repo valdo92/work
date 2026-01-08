@@ -8,8 +8,8 @@ from transformers import AutoTokenizer, AutoModel
 from tqdm import tqdm
 
 # Configuration
-#MODEL_NAME = 'allenai/scibert_scivocab_uncased' 
-MODEL_NAME= 'bert-base-uncased'
+MODEL_NAME = 'allenai/scibert_scivocab_uncased' 
+#MODEL_NAME= 'bert-base-uncased'
 MAX_TOKEN_LENGTH = 128
 
 # Load BERT model
